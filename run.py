@@ -11,7 +11,66 @@ import torch.nn.functional as F
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
+import copy
 
+
+token_lens = [0, 1, 3, 5, 10, 20, 30]
+
+@torch.no_grad()
+def calculateInfillPerplexity(sentence, model, tokenizer, gpu):
+    
+    input_ids = torch.tensor(tokenizer.encode(sentence)).unsqueeze(0)
+    input_ids = input_ids.to(gpu)
+
+    logits = model(input_ids=input_ids, labels=input_ids).logits
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    mu = (probs[0] * log_probs[0]).sum(-1)
+    sigma = ((probs[0]) * torch.square(log_probs[0])).sum(-1) - torch.square(mu)
+
+    all_ratios = {}
+    for token_len in token_lens:
+        all_ratios[token_len] = []
+
+    token_count = input_ids.shape[-1]
+    for i in range(token_count-1):
+
+        # top p(w2 | w1)
+        top_k_probs = torch.sort(probs[:, i, :], dim=-1, descending=True)
+
+        token_id = input_ids[:, i+1]
+        opt_token_id = top_k_probs.indices[:, 0]
+
+        if token_id != opt_token_id:
+            input_tokens_i = copy.deepcopy(input_ids)
+            input_tokens_i[:, i+1] = opt_token_id
+
+            logits_opt = model(input_ids = input_tokens_i, labels = input_tokens_i).logits
+            probs_opt = torch.nn.functional.softmax(logits_opt, dim=-1)
+            log_probs_opt = torch.nn.functional.log_softmax(logits_opt, dim=-1)
+
+            mu_opt = (probs_opt[0] * log_probs_opt[0]).sum(-1)
+            sigma_opt = ((probs_opt[0]) * torch.square(log_probs_opt[0])).sum(-1) - torch.square(mu)
+
+            # w1 w2_training w3, w1 w2_most_likely w3
+            # ratio = p(w2_training | w1 w3) / p(w2_most_likely | w1 w3)
+            ratios = {}
+
+            for token_len in token_lens:
+                ratios[token_len] = ((log_probs[:, i, token_id] - mu[i]) / sigma[i].sqrt()) - ((log_probs_opt[:, i, opt_token_id] - mu_opt[i]) / sigma_opt[i].sqrt()) 
+
+            for token_len in token_lens:
+                for j in range(i, min(i+token_len, token_count-3)):
+                    next_token_id = input_ids[:, j+2]
+                    r =  ((log_probs[:, j+1, next_token_id] - mu[i]) / sigma[i].sqrt()) - ((log_probs_opt[:, j+1, next_token_id] - mu_opt[i]) / sigma_opt[i].sqrt())
+                    ratios[token_len] = ratios[token_len] + r
+                all_ratios[token_len].append(ratios[token_len].item())
+        else:
+            for token_len in token_lens:
+                all_ratios[token_len].append(0.)
+        
+    return all_ratios
 
 # helper function
 def convert_huggingface_data_to_list_dic(dataset):
@@ -111,6 +170,18 @@ for i, d in enumerate(tqdm(data, total=len(data), desc='Samples')):
         k_length = int(len(mink_plus) * ratio)
         topk = np.sort(mink_plus.cpu())[:k_length]
         scores[f'mink++_{ratio}'].append(np.mean(topk).item())
+    
+    ## ours: InfillMIA
+    infill_probs = calculateInfillPerplexity(text, model, tokenizer, model.device)
+
+    for token_ind in infill_probs:
+        infill_prob = infill_probs[token_ind]
+        infill_prob = np.nan_to_num(infill_prob)
+
+        for ratio in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+            k_length = int(len(infill_prob) * ratio)
+            topk = np.sort(infill_prob)[:k_length]
+            scores[f'InfillMIA_{token_ind}tokens_{ratio}'].append(np.mean(topk).item())
 
 # compute metrics
 # tpr and fpr thresholds are hard-coded
@@ -132,7 +203,7 @@ for method, scores in scores.items():
     results['tpr05'].append(f"{tpr05:.1%}")
 
 df = pd.DataFrame(results)
-print(df)
+print(df.to_string())
 
 save_root = f"results/{args.dataset}"
 if not os.path.exists(save_root):
